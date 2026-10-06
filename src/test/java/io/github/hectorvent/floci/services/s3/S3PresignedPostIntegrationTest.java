@@ -1,16 +1,23 @@
 package io.github.hectorvent.floci.services.s3;
 
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.Base64;
+import java.util.zip.CRC32;
+import java.util.zip.CRC32C;
+import java.util.zip.Checksum;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -751,5 +758,196 @@ class S3PresignedPostIntegrationTest {
         .then()
             .statusCode(200)
             .header("x-amz-version-id", is(versionId));
+    }
+
+    // Presigned POST checksum form fields. Evidence: sha256 and crc32 verified against live S3
+    // (match 204 + stored FULL_OBJECT, mismatch 400 BadDigest and nothing stored). crc32c and sha1
+    // follow the AWS POST Object docs and the same message pattern; they were not probed live.
+    private static final String CHECKSUM_BUCKET = "presigned-post-checksum-bucket";
+    private static final byte[] CHECKSUM_BODY = "checksum body".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] OTHER_BODY = "different body".getBytes(StandardCharsets.UTF_8);
+
+    private static String digest(String algorithm, byte[] data) {
+        try {
+            return Base64.getEncoder().encodeToString(MessageDigest.getInstance(algorithm).digest(data));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    private static String crc(Checksum checksum, byte[] data) {
+        checksum.update(data, 0, data.length);
+        return Base64.getEncoder().encodeToString(ByteBuffer.allocate(4).putInt((int) checksum.getValue()).array());
+    }
+
+    private static String checksumOf(String algo, byte[] data) {
+        return switch (algo) {
+            case "sha256" -> digest("SHA-256", data);
+            case "sha1" -> digest("SHA-1", data);
+            case "crc32" -> crc(new CRC32(), data);
+            case "crc32c" -> crc(new CRC32C(), data);
+            default -> throw new IllegalArgumentException(algo);
+        };
+    }
+
+    private RequestSpecification checksumPost(String key, String fieldName, String fieldValue, byte[] body) {
+        String expiration = Instant.now().plusSeconds(3600).atZone(ZoneOffset.UTC)
+                .format(DateTimeFormatter.ISO_INSTANT);
+        String policy = """
+                {"expiration": "%s", "conditions": [{"bucket": "%s"}, {"key": "%s"},
+                 {"Content-Type": "text/plain"}, {"%s": "%s"}, ["content-length-range", 0, 10485760]]}
+                """.formatted(expiration, CHECKSUM_BUCKET, key, fieldName.toLowerCase(), fieldValue);
+        RequestSpecification spec = given()
+                .multiPart("key", key)
+                .multiPart("Content-Type", "text/plain")
+                .multiPart("policy", Base64.getEncoder().encodeToString(policy.getBytes(StandardCharsets.UTF_8)))
+                .multiPart("x-amz-algorithm", "AWS4-HMAC-SHA256")
+                .multiPart("x-amz-date", AMZ_DATE_FORMAT.format(Instant.now()))
+                .multiPart(fieldName, fieldValue);
+        return spec.multiPart("file", "f.txt", body, "text/plain");
+    }
+
+    private void assertChecksumStored(String key, String algo, String expected) {
+        given().header("x-amz-checksum-mode", "ENABLED")
+        .when().head("/" + CHECKSUM_BUCKET + "/" + key)
+        .then().statusCode(200)
+            .header("x-amz-checksum-" + algo, equalTo(expected))
+            .header("x-amz-checksum-type", equalTo("FULL_OBJECT"));
+        given().header("x-amz-checksum-mode", "ENABLED")
+        .when().get("/" + CHECKSUM_BUCKET + "/" + key)
+        .then().statusCode(200)
+            .header("x-amz-checksum-" + algo, equalTo(expected))
+            .header("x-amz-checksum-type", equalTo("FULL_OBJECT"));
+    }
+
+    private void assertBadDigestAndNothingStored(String key, String algo, String wireName, String expected) {
+        checksumPost(key, "x-amz-checksum-" + algo, expected, OTHER_BODY)
+        .when().post("/" + CHECKSUM_BUCKET)
+        .then().statusCode(400)
+            .body("Error.Code", equalTo("BadDigest"))
+            .body("Error.Message", equalTo(
+                    "The " + wireName + " you specified did not match the calculated checksum."));
+        given().when().head("/" + CHECKSUM_BUCKET + "/" + key).then().statusCode(404);
+    }
+
+    @Test
+    @Order(120)
+    void checksumBucketSetup() {
+        given().when().put("/" + CHECKSUM_BUCKET).then().statusCode(200);
+    }
+
+    @Test
+    @Order(121)
+    void postStoresSha256ChecksumOnMatch() {
+        String expected = checksumOf("sha256", CHECKSUM_BODY);
+        checksumPost("ck/sha256.txt", "x-amz-checksum-sha256", expected, CHECKSUM_BODY)
+        .when().post("/" + CHECKSUM_BUCKET).then().statusCode(204);
+        assertChecksumStored("ck/sha256.txt", "sha256", expected);
+    }
+
+    @Test
+    @Order(122)
+    void postStoresCrc32ChecksumOnMatch() {
+        String expected = checksumOf("crc32", CHECKSUM_BODY);
+        checksumPost("ck/crc32.txt", "x-amz-checksum-crc32", expected, CHECKSUM_BODY)
+        .when().post("/" + CHECKSUM_BUCKET).then().statusCode(204);
+        assertChecksumStored("ck/crc32.txt", "crc32", expected);
+    }
+
+    @Test
+    @Order(123)
+    void postStoresCrc32cChecksumOnMatch() {
+        String expected = checksumOf("crc32c", CHECKSUM_BODY);
+        checksumPost("ck/crc32c.txt", "x-amz-checksum-crc32c", expected, CHECKSUM_BODY)
+        .when().post("/" + CHECKSUM_BUCKET).then().statusCode(204);
+        assertChecksumStored("ck/crc32c.txt", "crc32c", expected);
+    }
+
+    @Test
+    @Order(124)
+    void postStoresSha1ChecksumOnMatch() {
+        String expected = checksumOf("sha1", CHECKSUM_BODY);
+        checksumPost("ck/sha1.txt", "x-amz-checksum-sha1", expected, CHECKSUM_BODY)
+        .when().post("/" + CHECKSUM_BUCKET).then().statusCode(204);
+        assertChecksumStored("ck/sha1.txt", "sha1", expected);
+    }
+
+    @Test
+    @Order(125)
+    void postRejectsSha256Mismatch() {
+        assertBadDigestAndNothingStored("ck/bad-sha256.txt", "sha256", "SHA256",
+                checksumOf("sha256", CHECKSUM_BODY));
+    }
+
+    @Test
+    @Order(126)
+    void postRejectsCrc32Mismatch() {
+        assertBadDigestAndNothingStored("ck/bad-crc32.txt", "crc32", "CRC32",
+                checksumOf("crc32", CHECKSUM_BODY));
+    }
+
+    @Test
+    @Order(127)
+    void postRejectsCrc32cMismatch() {
+        assertBadDigestAndNothingStored("ck/bad-crc32c.txt", "crc32c", "CRC32C",
+                checksumOf("crc32c", CHECKSUM_BODY));
+    }
+
+    @Test
+    @Order(128)
+    void postRejectsSha1Mismatch() {
+        assertBadDigestAndNothingStored("ck/bad-sha1.txt", "sha1", "SHA1",
+                checksumOf("sha1", CHECKSUM_BODY));
+    }
+
+    @Test
+    @Order(129)
+    void postChecksumFieldNameIsCaseInsensitive() {
+        String expected = checksumOf("sha256", CHECKSUM_BODY);
+        checksumPost("ck/mixed-case.txt", "X-Amz-Checksum-SHA256", expected, CHECKSUM_BODY)
+        .when().post("/" + CHECKSUM_BUCKET).then().statusCode(204);
+        assertChecksumStored("ck/mixed-case.txt", "sha256", expected);
+
+        checksumPost("ck/mixed-case-bad.txt", "X-Amz-Checksum-SHA256", expected, OTHER_BODY)
+        .when().post("/" + CHECKSUM_BUCKET).then().statusCode(400).body("Error.Code", equalTo("BadDigest"));
+        given().when().head("/" + CHECKSUM_BUCKET + "/ck/mixed-case-bad.txt").then().statusCode(404);
+    }
+
+    @Test
+    @Order(130)
+    void postAlgorithmFieldWithoutMatchingValueIsRejected() {
+        given()
+            .multiPart("key", "ck/algo-only.txt")
+            .multiPart("Content-Type", "text/plain")
+            .multiPart("x-amz-checksum-algorithm", "SHA256")
+            .multiPart("file", "f.txt", CHECKSUM_BODY, "text/plain")
+        .when().post("/" + CHECKSUM_BUCKET)
+        .then().statusCode(400).body("Error.Code", equalTo("InvalidRequest"));
+        given().when().head("/" + CHECKSUM_BUCKET + "/ck/algo-only.txt").then().statusCode(404);
+    }
+
+    @Test
+    @Order(131)
+    void postWithoutChecksumFieldStoresNoChecksum() {
+        given()
+            .multiPart("key", "ck/none.txt")
+            .multiPart("Content-Type", "text/plain")
+            .multiPart("file", "f.txt", CHECKSUM_BODY, "text/plain")
+        .when().post("/" + CHECKSUM_BUCKET).then().statusCode(204);
+        given().header("x-amz-checksum-mode", "ENABLED")
+        .when().head("/" + CHECKSUM_BUCKET + "/ck/none.txt")
+        .then().statusCode(200).header("x-amz-checksum-sha256", nullValue());
+    }
+
+    @Test
+    @Order(132)
+    void postIgnoresCrc64nvmeField() {
+        // The AWS POST Object docs do not list CRC64NVME, so it is not honoured on POST.
+        given()
+            .multiPart("key", "ck/crc64.txt")
+            .multiPart("Content-Type", "text/plain")
+            .multiPart("x-amz-checksum-crc64nvme", "AAAAAAAAAAA=")
+            .multiPart("file", "f.txt", CHECKSUM_BODY, "text/plain")
+        .when().post("/" + CHECKSUM_BUCKET).then().statusCode(204);
     }
 }
