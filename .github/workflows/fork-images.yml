@@ -1,0 +1,30 @@
+name: Fork Images
+
+# Fork-only. Builds Floci images from any branch, tag or commit of this fork
+# and publishes them to this owner's GHCR namespace. Run it from the Actions tab.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source-ref:
+        description: Branch, tag, or commit to build
+        required: true
+        default: djbender-presigned-post-checksum
+        type: string
+      publish-native:
+        description: Also build and publish the native and native compat images (slow)
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    uses: ./.github/workflows/build-images.yml
+    with:
+      source-ref: ${{ inputs.source-ref }}
+      image: ghcr.io/${{ github.repository_owner }}/floci
+      publish-native: ${{ inputs.publish-native }}
