@@ -3130,6 +3130,53 @@ public class S3Controller {
         return checksum;
     }
 
+    // The algorithms the AWS POST Object documentation lists for x-amz-checksum-algorithm.
+    private static final List<ChecksumAlgorithm> POST_CHECKSUM_ALGORITHMS = List.of(
+            ChecksumAlgorithm.CRC32, ChecksumAlgorithm.CRC32C, ChecksumAlgorithm.SHA1, ChecksumAlgorithm.SHA256);
+
+    /**
+     * Reads the x-amz-checksum-* form field of a presigned POST, rejects the upload with BadDigest when
+     * the body does not hash to it, and returns the checksum to store, or null when none was sent.
+     */
+    private S3Checksum verifiedPostChecksum(Map<String, String> lcFields, byte[] data) {
+        Map<ChecksumAlgorithm, String> claimed = new EnumMap<>(ChecksumAlgorithm.class);
+        for (ChecksumAlgorithm algorithm : POST_CHECKSUM_ALGORITHMS) {
+            String value = lcFields.get("x-amz-checksum-" + algorithm.wireValue());
+            if (value != null && !value.isBlank()) {
+                claimed.put(algorithm, value);
+            }
+        }
+        String declared = lcFields.get("x-amz-checksum-algorithm");
+        if (claimed.isEmpty() && (declared == null || declared.isBlank())) {
+            return null;
+        }
+        if (claimed.size() != 1) {
+            throw new AwsException("InvalidRequest",
+                    "Exactly one x-amz-checksum-* form field matching x-amz-checksum-algorithm is required.", 400);
+        }
+        ChecksumAlgorithm algorithm = claimed.keySet().iterator().next();
+        if (declared != null && !declared.isBlank() && !declared.trim().equalsIgnoreCase(algorithm.name())) {
+            throw new AwsException("InvalidRequest",
+                    "The x-amz-checksum-algorithm form field does not match the x-amz-checksum-* field provided.",
+                    400);
+        }
+        String expected = claimed.get(algorithm);
+        if (!expected.equals(algorithm.compute(data))) {
+            throw new AwsException("BadDigest", "The " + algorithm.name()
+                    + " you specified did not match the calculated checksum.", 400);
+        }
+        S3Checksum checksum = new S3Checksum();
+        switch (algorithm) {
+            case CRC32 -> checksum.setChecksumCRC32(expected);
+            case CRC32C -> checksum.setChecksumCRC32C(expected);
+            case SHA1 -> checksum.setChecksumSHA1(expected);
+            case SHA256 -> checksum.setChecksumSHA256(expected);
+            default -> throw new IllegalStateException("Unexpected POST checksum algorithm " + algorithm);
+        }
+        checksum.setChecksumType(ChecksumType.FULL_OBJECT);
+        return checksum;
+    }
+
     private String getChecksumAlgorithm(HttpHeaders httpHeaders, UriInfo uriInfo) {
         String algorithm = resolveHeaderOrQueryParam(httpHeaders, uriInfo, "x-amz-checksum-algorithm");
         if (algorithm == null || algorithm.isBlank()) {
@@ -3575,8 +3622,13 @@ public class S3Controller {
             }
         }
 
+        S3Checksum postChecksum = verifiedPostChecksum(lcFields, fileData);
+        PutObjectOptions postOptions = new PutObjectOptions();
+        if (postChecksum != null) {
+            postOptions.withClientChecksum(postChecksum);
+        }
         S3Object obj = s3Service.postObject(bucket, key, fileData, objectContentType,
-                metadata.isEmpty() ? null : metadata);
+                metadata.isEmpty() ? null : metadata, postOptions);
         LOG.infov("Presigned POST upload: {0}/{1} ({2} bytes)", bucket, key, fileData.length);
 
         String xml = new XmlBuilder()
