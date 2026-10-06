@@ -12,9 +12,9 @@ on:
         default: main
         type: string
       publish-native:
-        description: Also build and publish the native and native compat images (slow)
+        description: Also build and publish the native and native compat images (slow). Untick for a quick JVM-only image
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
