@@ -9,7 +9,7 @@ on:
       source-ref:
         description: Branch, tag, or commit to build
         required: true
-        default: main
+        default: fork/main
         type: string
       publish-native:
         description: Also build and publish the native and native compat images (slow). Untick for a quick JVM-only image

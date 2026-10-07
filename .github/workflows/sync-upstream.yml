@@ -46,21 +46,69 @@ jobs:
             gh issue create --repo "$REPO" --label upstream-sync --title "Upstream sync needs manual fast-forward" --body "$body"
           fi
 
-      - name: Open sync PR into fork/main
+      - name: Resolve latest upstream release
+        id: rel
         run: |
-          ahead=$(gh api "repos/$REPO/compare/fork/main...main" -q .ahead_by)
-          if [ "$ahead" -eq 0 ]; then
-            echo "fork/main already contains main"
+          tag=$(gh api repos/floci-io/floci/releases/latest -q .tag_name)
+          if ! [[ "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unexpected release tag: $tag"
+            exit 1
+          fi
+          sha=$(gh api "repos/floci-io/floci/commits/$tag" -q .sha)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Fast-forward upstream-release to the release
+        id: rb
+        run: |
+          current=$(gh api "repos/$REPO/git/ref/heads/upstream-release" -q .object.sha 2>/dev/null || true)
+          if [ "$current" = "${{ steps.rel.outputs.sha }}" ]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "upstream-release already at ${{ steps.rel.outputs.tag }}"
             exit 0
           fi
-          open=$(gh pr list --repo "$REPO" --base fork/main --head main --state open --json number -q '.[0].number')
+          if [ -n "$current" ]; then
+            cmd=(gh api -X PATCH "repos/$REPO/git/refs/heads/upstream-release" -f sha="${{ steps.rel.outputs.sha }}" -F force=false)
+          else
+            cmd=(gh api -X POST "repos/$REPO/git/refs" -f ref=refs/heads/upstream-release -f sha="${{ steps.rel.outputs.sha }}")
+          fi
+          if out=$("${cmd[@]}" 2>&1); then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            gh api -X POST "repos/$REPO/git/refs" -f ref="refs/tags/${{ steps.rel.outputs.tag }}" -f sha="${{ steps.rel.outputs.sha }}" >/dev/null 2>&1 || true
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "$out" > rb-error.txt
+            cat rb-error.txt
+          fi
+
+      - name: Report a blocked upstream-release update
+        if: steps.rb.outputs.ok == 'false'
+        run: |
+          body=$(printf 'Moving `upstream-release` to `%s` failed, usually because the release changed `.github/workflows/*`, which `GITHUB_TOKEN` cannot push.\n\nRun locally:\n\n```\ngit fetch upstream --tags\ngit push origin %s^{commit}:refs/heads/upstream-release %s\n```\n\nError:\n\n```\n%s\n```\n' "${{ steps.rel.outputs.tag }}" "${{ steps.rel.outputs.tag }}" "${{ steps.rel.outputs.tag }}" "$(cat rb-error.txt)")
+          gh label create --repo "$REPO" upstream-sync --color 0e8a16 --force >/dev/null
+          existing=$(gh issue list --repo "$REPO" --label upstream-sync --state open --json number -q '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment --repo "$REPO" "$existing" --body "$body"
+          else
+            gh issue create --repo "$REPO" --label upstream-sync --title "Upstream release needs manual sync" --body "$body"
+          fi
+
+      - name: Open release PR into fork/main
+        if: steps.rb.outputs.ok == 'true'
+        run: |
+          tag="${{ steps.rel.outputs.tag }}"
+          ahead=$(gh api "repos/$REPO/compare/fork/main...upstream-release" -q .ahead_by)
+          if [ "$ahead" -eq 0 ]; then
+            echo "fork/main already contains $tag"
+            exit 0
+          fi
+          open=$(gh pr list --repo "$REPO" --base fork/main --head upstream-release --state open --json number -q '.[0].number')
           if [ -n "$open" ]; then
             echo "PR #$open already open"
             exit 0
           fi
-          sha=$(gh api "repos/$REPO/commits/main" -q '.sha[0:9]')
-          gh pr create --repo "$REPO" --base fork/main --head main \
-            --title "chore: sync upstream ($sha)" \
-            --body "Upstream commits on \`main\` not yet in \`fork/main\` ($ahead).
+          gh pr create --repo "$REPO" --base fork/main --head upstream-release \
+            --title "chore: sync upstream $tag" \
+            --body "Upstream release [$tag](https://github.com/floci-io/floci/releases/tag/$tag) ($ahead commits not yet in \`fork/main\`).
 
-          Merge with **Create a merge commit**. Never squash or rebase. PRs opened by \`GITHUB_TOKEN\` do not run CI automatically: close and reopen to trigger it."
+          Merge with **Create a merge commit**. Never squash or rebase. Merging builds the fork images automatically (\`fork-release.yml\`). PRs opened by \`GITHUB_TOKEN\` do not run CI automatically: close and reopen to trigger it."
