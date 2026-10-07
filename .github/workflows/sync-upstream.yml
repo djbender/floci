@@ -59,7 +59,7 @@ jobs:
             exit 0
           fi
           sha=$(gh api "repos/$REPO/commits/main" -q '.sha[0:9]')
-          gh pr create --base fork/main --head main \
+          gh pr create --repo "$REPO" --base fork/main --head main \
             --title "chore: sync upstream ($sha)" \
             --body "Upstream commits on \`main\` not yet in \`fork/main\` ($ahead).
 
