@@ -1,12 +1,12 @@
 name: Fork Release
 
-# Fork-only. When fork/main takes in a new upstream release, tags it X.Y.Z+fork.1,
+# Fork-only. When fork/release takes in a new upstream release, tags it X.Y.Z+fork.1,
 # builds the images and publishes them. Run manually with bump to cut +fork.N+1
 # for a fork-only fix on the same upstream release.
 
 on:
   push:
-    branches: [fork/main]
+    branches: [fork/release]
     paths-ignore:
       - '**.md'
       - 'docs/**'

@@ -7,17 +7,17 @@ built only on top of upstream semver releases, never on unreleased upstream `mai
 
 - `main`: full mirror of upstream `main`. Never commit to it. Branch from it to contribute upstream.
 - `upstream-release`: fast-forwarded to the latest upstream release tag (`X.Y.Z`). Never commit to it.
-- `fork/main`: default branch. An upstream release plus fork-only patches.
+- `fork/release`: default branch. An upstream release plus fork-only patches.
 
 ```
-floci-io release tag -> djbender/upstream-release -> (PR, merge commit) -> djbender/fork/main
+floci-io release tag -> djbender/upstream-release -> (PR, merge commit) -> djbender/fork/release
 ```
 
 ## Syncing
 
 `.github/workflows/sync-upstream.yml` runs daily. It fast-forwards `main`, moves
 `upstream-release` to the latest upstream release (pre-releases are ignored) and opens an
-`upstream-release` -> `fork/main` PR. Merge it with **Create a merge commit**, never squash or rebase.
+`upstream-release` -> `fork/release` PR. Merge it with **Create a merge commit**, never squash or rebase.
 
 If a fast-forward is blocked (the update changed workflow files, which `GITHUB_TOKEN` cannot
 push), an `upstream-sync` issue is opened with the commands. They are:
@@ -28,7 +28,7 @@ push), an `upstream-sync` issue is opened with the commands. They are:
 
 ## Versions and images
 
-Merging a new upstream release into `fork/main` triggers `.github/workflows/fork-release.yml`.
+Merging a new upstream release into `fork/release` triggers `.github/workflows/fork-release.yml`.
 It tags `X.Y.Z+fork.1`, builds the images and creates a GitHub release. Images in
 `ghcr.io/djbender/floci`:
 
@@ -36,12 +36,12 @@ It tags `X.Y.Z+fork.1`, builds the images and creates a GitHub release. Images i
 - the same with `-native` and `-native-compat` suffixes
 
 For a fork-only fix on the same release, run **Fork Release** manually with `bump` ticked to
-cut `X.Y.Z+fork.N+1`. Other pushes to `fork/main` do not build. **Fork Images** remains for
+cut `X.Y.Z+fork.N+1`. Other pushes to `fork/release` do not build. **Fork Images** remains for
 ad hoc builds of any ref.
 
 ## Conflicts
 
     git fetch origin
-    git switch -c sync/upstream-$(date +%F) origin/fork/main
+    git switch -c sync/upstream-$(date +%F) origin/fork/release
     git merge origin/upstream-release
-    # resolve, commit, push, open a PR into fork/main
+    # resolve, commit, push, open a PR into fork/release
