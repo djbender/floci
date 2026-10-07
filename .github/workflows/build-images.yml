@@ -280,9 +280,13 @@ jobs:
           name: floci-native-arm64-${{ needs.prepare.outputs.image-tag }}
           path: native/arm64/
 
-      - name: Make native binaries executable
+      - name: Stage native binaries under the fixed name Dockerfile.native-package expects
         if: inputs.publish-native
-        run: chmod +x native/amd64/*-runner native/arm64/*-runner
+        run: |
+          for arch in amd64 arm64; do
+            mv native/$arch/*-runner native/$arch/application
+            chmod +x native/$arch/application
+          done
 
       - name: Set build metadata
         id: metadata
